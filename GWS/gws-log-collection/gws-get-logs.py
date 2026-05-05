@@ -5,6 +5,8 @@ import requests
 import os
 import argparse
 import logging
+import shutil
+import tempfile
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 from dateutil import parser as dateparser, tz
@@ -77,6 +79,7 @@ class Google(object):
         """
 
         total_saved, total_found = 0, 0
+        base_from_date = from_date
 
         for app in self.app_list:
 
@@ -84,19 +87,20 @@ class Google(object):
             output_file = f"{self.output_path}/{app}_logs.json"
 
             # Get most recent log entry date (if required)
+            only_after_datetime = base_from_date
             if self.update:
-                from_date = self._check_recent_date(output_file) or from_date
+                only_after_datetime = self._check_recent_date(output_file) or base_from_date
 
             # Collect logs for specified app
             logging.info(f"Collecting logs for {app}...")
-            if from_date:
-                logging.debug(f"Only extracting records after {from_date}")
+            if only_after_datetime:
+                logging.debug(f"Only extracting records after {only_after_datetime}")
 
             saved, found = self._get_activity_logs(
                 app, 
                 output_file=output_file, 
                 overwrite=self.overwrite, 
-                only_after_datetime=from_date
+                only_after_datetime=only_after_datetime
             )
             logging.info(f"Saved {saved} of {found} entries for {app}")
             total_saved += saved
@@ -107,35 +111,81 @@ class Google(object):
     def _get_activity_logs(self, application_name, output_file, overwrite=False, only_after_datetime=None):
         """ Collect activitiy logs from the specified application """
 
-        # Call the Admin SDK Reports API
-        try:
-            results = self.service.activities().list(
-                userKey='all', applicationName=application_name).execute()
-        except TypeError as e:
-            logging.error(f"Error collecting logs for {application_name}: {e}")
-            return False, False
-
-        activities = results.get('items', [])
         output_count = 0
-        if activities:
-            with open(output_file, 'w' if overwrite else 'a') as output:
+        total_count = 0
+        next_page_token = None
+        output_dir = os.path.dirname(os.path.abspath(output_file)) or '.'
+        page_files = []
+        staged_output = None
+        found_activities = False
 
-                # Loop through activities in reverse order (so latest events are at the end)
-                for entry in activities[::-1]:
-                    # TODO: See if we can speed this up to prevent looping through all activities
+        try:
+            while True:
+                request = {
+                    'userKey': 'all',
+                    'applicationName': application_name
+                }
+                if only_after_datetime:
+                    request['startTime'] = only_after_datetime.astimezone(
+                        tz.gettz('UTC')).isoformat().replace('+00:00', 'Z')
+                if next_page_token:
+                    request['pageToken'] = next_page_token
 
-                    # If we're only exporting new records, check the datetime of the record
-                    if only_after_datetime:
-                        entry_datetime = dateparser.parse(entry['id']['time'])
-                        if (entry_datetime <= only_after_datetime):
-                            continue  # Skip this record
+                try:
+                    results = self.service.activities().list(**request).execute()
+                except TypeError as e:
+                    logging.error(f"Error collecting logs for {application_name}: {e}")
+                    return False, False
 
-                    # Output this record
-                    json_formatted_str = json.dumps(entry)
-                    output.write(f"{json_formatted_str}\n")
-                    output_count += 1
+                activities = results.get('items', [])
+                total_count += len(activities)
+                if activities:
+                    found_activities = True
+                    fd, page_file = tempfile.mkstemp(
+                        prefix='gws_page_', suffix='.json', dir=output_dir)
+                    page_files.append(page_file)
+                    with os.fdopen(fd, 'w') as page_output:
+                        # Loop through activities in reverse order (so latest events are at the end)
+                        for entry in activities[::-1]:
+                            # TODO: See if we can speed this up to prevent looping through all activities
 
-        return output_count, len(activities)
+                            # If we're only exporting new records, check the datetime of the record
+                            if only_after_datetime:
+                                entry_datetime = dateparser.parse(entry['id']['time'])
+                                if (entry_datetime <= only_after_datetime):
+                                    continue  # Skip this record
+
+                            # Output this record
+                            json_formatted_str = json.dumps(entry)
+                            page_output.write(f"{json_formatted_str}\n")
+                            output_count += 1
+
+                next_page_token = results.get('nextPageToken')
+                if not next_page_token:
+                    break
+
+            if found_activities:
+                fd, staged_output = tempfile.mkstemp(
+                    prefix='gws_logs_', suffix='.json', dir=output_dir)
+                with os.fdopen(fd, 'w') as staged_file:
+                    for page_file in page_files[::-1]:
+                        with open(page_file, 'r') as page_output:
+                            shutil.copyfileobj(page_output, staged_file)
+
+                if overwrite:
+                    os.replace(staged_output, output_file)
+                    staged_output = None
+                else:
+                    with open(output_file, 'a') as output, open(staged_output, 'r') as staged_file:
+                        shutil.copyfileobj(staged_file, output)
+
+            return output_count, total_count
+        finally:
+            if staged_output and os.path.exists(staged_output):
+                os.remove(staged_output)
+            for page_file in page_files:
+                if os.path.exists(page_file):
+                    os.remove(page_file)
 
 
 if __name__ == '__main__':
